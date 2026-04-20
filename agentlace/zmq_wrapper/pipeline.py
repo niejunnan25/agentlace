@@ -32,14 +32,19 @@ class Producer:
         if ip == "localhost":
             ip = "127.0.0.1"
         url = f"tcp://{ip}:{port}"
-        context = zmq.Context()
-        self.zmq_socket = context.socket(zmq.PUSH)
+        self.context = zmq.Context()
+        self.zmq_socket = self.context.socket(zmq.PUSH)
+        self.zmq_socket.setsockopt(zmq.LINGER, 0)
         self.zmq_socket.connect(url)
         self.compress, self.decompress = make_compression_method(compression)
 
     def send_msg(self, msg):
         msg = self.compress(msg)
         self.zmq_socket.send(msg)
+
+    def close(self):
+        self.zmq_socket.close(linger=0)
+        self.context.term()
 
 ##############################################################################
 
@@ -52,31 +57,43 @@ class Consumer:
                  port: int = 5547,
                  compression: str = 'lz4'):
         logging.debug(f"Initializing pipe consumer [localhost:{port}]")
-        context = zmq.Context()
-        self.results_receiver = context.socket(zmq.PULL)
+        self.context = zmq.Context()
+        self.results_receiver = self.context.socket(zmq.PULL)
+        self.results_receiver.setsockopt(zmq.RCVTIMEO, 100)
+        self.results_receiver.setsockopt(zmq.LINGER, 0)
         url = f"tcp://*:{port}"
         self.results_receiver.bind(url)
         self.callback_fn = callback_fn
         self.compress, self.decompress = make_compression_method(compression)
+        self.thread = None
+        self.is_kill = False
 
     def start(self):
         """blocking start method."""
         self.is_kill = False
         while self.is_kill is False:
-            message = self.results_receiver.recv()
+            try:
+                message = self.results_receiver.recv()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                if self.is_kill:
+                    break
+                raise
             message = self.decompress(message)
             self.callback_fn(message)
 
     def async_start(self):
         """non-blocking start method."""
-        self.thread = threading.Thread(target=self.start)
+        self.thread = threading.Thread(target=self.start, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.is_kill = True
-        if self.thread:
-            self.thread.join()
-        self.results_receiver.close()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        self.results_receiver.close(linger=0)
+        self.context.term()
 
 
 ##############################################################################

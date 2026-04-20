@@ -4,21 +4,29 @@ import hashlib
 import pickle
 import sys
 import numpy as np
-import cv2
 import pickle
 import zlib
 import lz4.frame
 from typing import Tuple, Callable
 
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional image helper dependency
+    cv2 = None
+
 
 def mat_to_jpeg(img):
     """Compresses a numpy array into a JPEG byte array."""
+    if cv2 is None:
+        raise ImportError("opencv-python is required for mat_to_jpeg")
     _, buf = cv2.imencode(".jpg", img)
     return buf.tobytes()
 
 
 def jpeg_to_mat(buf):
     """Decompresses a JPEG byte array into a numpy array."""
+    if cv2 is None:
+        raise ImportError("opencv-python is required for jpeg_to_mat")
     return cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
 
 

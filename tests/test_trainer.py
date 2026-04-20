@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 
-import time
 import logging
-from agentlace.trainer import TrainerClient, TrainerServer, TrainerConfig
-from agentlace.data.data_store import QueuedDataStore, DataStoreBase
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+from typing import Any
+from pathlib import Path
 
 import numpy as np
-from typing import Any
+
+from agentlace.data.data_store import DataStoreBase
+from agentlace.data.data_store import QueuedDataStore
+from agentlace.trainer import TrainerClient
+from agentlace.trainer import TrainerConfig
+from agentlace.trainer import TrainerServer
 
 CLIENT_CAPACITY = 3
 SERVER_CAPACITY = 6
@@ -46,6 +55,19 @@ def insert_helper(ds: DataStoreBase, data: Any):
         ds.insert({"index": data}, end_of_trajectory=False)
     else:
         ds.insert(data)
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return int(sock.getsockname()[1])
+
+
+class SlowQueuedDataStore(QueuedDataStore):
+    def batch_insert(self, batch_data):
+        time.sleep(0.25)
+        super().batch_insert(batch_data)
 
 ################################################################################
 
@@ -94,10 +116,9 @@ def test_trainer():
 
     # 1. Set up Trainer Server
     trainer_config = TrainerConfig(
-        port_number=5555,
-        broadcast_port=5556,
+        port_number=find_free_port(),
+        broadcast_port=find_free_port(),
         request_types=["get-stats"],
-        # experimental_pipeline_port=5547,
     )
     server = TrainerServer(trainer_config, new_data_callback, request_callback)
 
@@ -140,6 +161,10 @@ def test_trainer():
 
     assert len(
         ds_trainer1) == 2, f"Invalid server data store length {len(ds_trainer1)}"
+    sync_status = client.get_transport_status("table1")
+    assert sync_status["transport_mode"] == "sync_commit"
+    assert sync_status["accepted_update_id"] == sync_status["committed_update_id"]
+    assert client.wait_until_committed("table1")
 
     # 4 More tests on insertions and queues
     insert_helper(ds_actor1, np.array([7, 8, 9]))
@@ -192,11 +217,99 @@ def test_trainer():
     print("[test_trainer] All tests passed!\n")
 
 
+def test_trainer_client_uses_control_timeout_ms_by_default():
+    trainer_config = TrainerConfig(
+        port_number=find_free_port(),
+        broadcast_port=find_free_port(),
+        control_timeout_ms=123,
+    )
+    server = TrainerServer(trainer_config)
+    server.register_data_store("table1", QueuedDataStore(8))
+    server.start(threaded=True)
+
+    client = TrainerClient(
+        "table1",
+        "127.0.0.1",
+        trainer_config,
+        data_store=QueuedDataStore(8),
+        wait_for_server=True,
+    )
+
+    try:
+        assert client.req_rep_client.timeout_ms == 123
+    finally:
+        client.stop()
+        server.stop()
+
+
+def test_pipeline_wait_until_committed_and_stop_regression():
+    trainer_config = TrainerConfig(
+        port_number=find_free_port(),
+        broadcast_port=find_free_port(),
+        experimental_pipeline_port=find_free_port(),
+        commit_poll_ms=10,
+    )
+    server = TrainerServer(trainer_config)
+    learner_store = SlowQueuedDataStore(16)
+    server.register_data_store("table1", learner_store)
+    server.start(threaded=True)
+
+    actor_store = QueuedDataStore(16)
+    client = TrainerClient(
+        "table1",
+        "127.0.0.1",
+        trainer_config,
+        data_store=actor_store,
+        wait_for_server=True,
+    )
+
+    try:
+        actor_store.insert(np.array([1, 2, 3]))
+        actor_store.insert(np.array([4, 5, 6]))
+        assert client.update() is True
+        assert client.wait_until_committed("table1", timeout_s=2.0) is True
+        assert learner_store.latest_data_id() == actor_store.latest_data_id()
+    finally:
+        client.stop()
+        server.stop()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    stop_script = textwrap.dedent(
+        f"""
+        import time
+        from agentlace.data.data_store import QueuedDataStore
+        from agentlace.trainer import TrainerConfig, TrainerServer
+
+        server = TrainerServer(
+            TrainerConfig(
+                port_number={find_free_port()},
+                broadcast_port={find_free_port()},
+                experimental_pipeline_port={find_free_port()},
+            )
+        )
+        server.register_data_store("table1", QueuedDataStore(8))
+        server.start(threaded=True)
+        time.sleep(0.1)
+        server.stop()
+        print("stopped", flush=True)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", stop_script],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=3.0,
+        check=True,
+    )
+    assert "stopped" in proc.stdout
+
+
 def stress_test_trainer():
     # 1. Set up Trainer Server
     trainer_config = TrainerConfig(
-        port_number=5567,
-        broadcast_port=5568,
+        port_number=find_free_port(),
+        broadcast_port=find_free_port(),
         # NOTE: use pipe for faster datastore update
         # show that speed up from 0.06 to 0.005 sec in stress test
         # experimental_pipeline_port=5547,
